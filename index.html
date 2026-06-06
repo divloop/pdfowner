@@ -552,12 +552,17 @@
 
 async function stripPNBWatermark(arrayBuffer) {
   try {
-    const bytes = new Uint8Array(arrayBuffer.slice(0));
-    const enc = new TextEncoder();
+    const bytes  = new Uint8Array(arrayBuffer.slice(0));
     const pdfStr = new TextDecoder('latin1').decode(bytes);
+    const enc    = new TextEncoder();
 
+    // Only scan small FlateDecode streams (watermarks are < 2KB compressed)
+    // Large streams are page content, fonts, images - never touch them
     const objPattern = /\/FlateDecode[^\n]*\/Length\s+(\d+)[^\n]*>>\s*stream\r?\n/g;
-    const wmUserId   = /\b\d{6,10}\b/;
+
+    // Watermark signature: BOTH a 7-digit user-ID AND a DD-MM-YYYY HH:MM timestamp
+    // Must match together - this combination only appears in PNB download stamps
+    const wmUserId   = /\b\d{7}\b/;
     const wmDateTime = /\b\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}\b/;
     const wmArtifact = /\/Artifact\s+BMC/;
 
@@ -565,14 +570,18 @@ async function stripPNBWatermark(arrayBuffer) {
       for (const fmt of ['deflate', 'deflate-raw']) {
         try {
           const ds = new DecompressionStream(fmt);
-          const w = ds.writable.getWriter();
-          const r = ds.readable.getReader();
+          const w  = ds.writable.getWriter();
+          const r  = ds.readable.getReader();
           w.write(data); w.close();
           const chunks = [];
-          while (true) { const {done, value} = await r.read(); if (done) break; chunks.push(value); }
+          while (true) {
+            const {done, value} = await r.read();
+            if (done) break;
+            chunks.push(value);
+          }
           const total = chunks.reduce((s, c) => s + c.length, 0);
-          const buf = new Uint8Array(total);
-          let off = 0;
+          const buf   = new Uint8Array(total);
+          let   off   = 0;
           for (const c of chunks) { buf.set(c, off); off += c.length; }
           return new TextDecoder('latin1').decode(buf);
         } catch(e) { continue; }
@@ -581,40 +590,48 @@ async function stripPNBWatermark(arrayBuffer) {
     }
 
     async function makeEmpty() {
-      const emptyContent = enc.encode('q\nQ\n');
       const cs = new CompressionStream('deflate');
-      const cw = cs.writable.getWriter(); const cr = cs.readable.getReader();
-      cw.write(emptyContent); cw.close();
-      const cChunks = [];
-      while (true) { const {done, value} = await cr.read(); if (done) break; cChunks.push(value); }
-      const out = new Uint8Array(cChunks.reduce((s,c)=>s+c.length,0));
-      let off = 0;
-      for (const c of cChunks) { out.set(c, off); off += c.length; }
+      const cw = cs.writable.getWriter();
+      const cr = cs.readable.getReader();
+      cw.write(enc.encode('q\nQ\n')); cw.close();
+      const chunks = [];
+      while (true) { const {done, value} = await cr.read(); if (done) break; chunks.push(value); }
+      const out = new Uint8Array(chunks.reduce((s,c)=>s+c.length,0));
+      let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
       return out;
     }
 
-    let m;
-    let stripped = 0;
+    let m, stripped = 0;
     while ((m = objPattern.exec(pdfStr)) !== null) {
       const len = parseInt(m[1]);
-      const streamDataStart = m.index + m[0].length;
-      const streamDataEnd = streamDataStart + len;
-      if (streamDataEnd > bytes.length) continue;
-      const compressed = bytes.slice(streamDataStart, streamDataEnd);
+
+      // ONLY scan small streams - watermarks are tiny (< 2KB compressed)
+      // This prevents touching any page content, font or image streams
+      if (len < 10 || len > 2000) continue;
+
+      const streamStart = m.index + m[0].length;
+      const streamEnd   = streamStart + len;
+      if (streamEnd > bytes.length) continue;
+
+      const compressed   = bytes.slice(streamStart, streamEnd);
       const decompressed = await decompress(compressed);
       if (!decompressed) continue;
+
+      // Must match BOTH user-ID and date-time together (not just any number)
       const isWatermark =
         wmArtifact.test(decompressed) ||
         (wmUserId.test(decompressed) && wmDateTime.test(decompressed));
+
       if (isWatermark) {
-        console.log('Stripping WM stream len='+len+':', decompressed.substring(0,120));
+        console.log('Stripping WM stream len=' + len + ':', decompressed.substring(0, 80));
         const empty = await makeEmpty();
-        bytes.fill(0x20, streamDataStart, streamDataEnd);
-        bytes.set(empty, streamDataStart);
+        bytes.fill(0x20, streamStart, streamEnd);
+        bytes.set(empty, streamStart);
         stripped++;
       }
     }
-    console.log('WM stripping done, blanked:', stripped);
+
+    console.log('WM stripping done, streams blanked:', stripped);
     return bytes.buffer;
   } catch(e) {
     console.warn('WM strip error:', e);
@@ -834,193 +851,116 @@ btnSave.addEventListener('click', async () => {
   }
 });
 
-// ── PAGE RANGE EXTRACTOR (uses PDF.js to re-render pages into a new PDF via canvas) ──
+// -- PAGE RANGE EXTRACTOR --
 async function extractPageRange(arrayBuffer, fromPage, toPage) {
-  // Load the stripped PDF
   const srcDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
-
-  // We'll build a minimal PDF manually using PDF.js canvas rendering
-  // Each page is rendered to canvas → JPEG data → embedded in a new PDF
-  const pageDataList = [];
+  const pageData = [];
   for (let p = fromPage; p <= toPage; p++) {
-    const page = await srcDoc.getPage(p);
-    const vp = page.getViewport({ scale: 2.0 });
+    const page   = await srcDoc.getPage(p);
+    const vp     = page.getViewport({ scale: 2.0 });
     const canvas = document.createElement('canvas');
     canvas.width  = Math.round(vp.width);
     canvas.height = Math.round(vp.height);
     const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: ctx, viewport: vp }).promise;
-    const jpeg = canvas.toDataURL('image/jpeg', 0.92);
-    const b64 = jpeg.split(',')[1];
-    pageDataList.push({ b64, width: canvas.width, height: canvas.height,
-                        pdfW: vp.width / 2, pdfH: vp.height / 2 });
+    const jpeg = canvas.toDataURL('image/jpeg', 0.95);
+    pageData.push({
+      b64:  jpeg.split(',')[1],
+      w:    canvas.width,
+      h:    canvas.height,
+      pdfW: Math.round(vp.width  / 2),
+      pdfH: Math.round(vp.height / 2),
+    });
     canvas.width = canvas.height = 0; // free memory
   }
-
-  // Build a minimal PDF with one image per page
-  return buildImagePdf(pageDataList);
+  return buildPagesPDF(pageData);
 }
 
-function buildImagePdf(pages) {
-  // Minimal PDF builder — each page is a full-page JPEG image
-  const enc = s => s.split('').map(c => c.charCodeAt(0));
-  const str = s => s;
-
-  let pdf = '';
+// -- PDF BUILDER (used by both Save and Merge) --
+// Builds a valid PDF with one full-page JPEG per page.
+// Uses Uint8Array throughout so binary JPEG data is never corrupted.
+function buildPagesPDF(pages) {
+  const parts   = [];
   const offsets = [];
+  let   byteLen = 0;
 
-  const header = '%PDF-1.4\n%\xFF\xFF\xFF\xFF\n';
-  pdf += header;
-
-  // We'll track byte offsets manually
-  const getOffset = () => {
-    let n = 0;
-    for (let i = 0; i < pdf.length; i++) n += pdf.charCodeAt(i) > 127 ? 1 : 1;
-    return pdf.length;
-  };
-
-  let objNum = 0;
-  const objs = [];
-
-  function addObj(content) {
-    objNum++;
-    offsets.push(pdf.length);
-    pdf += `${objNum} 0 obj\n${content}\nendobj\n`;
-    return objNum;
+  function wStr(s) {
+    const a = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xFF;
+    parts.push(a); byteLen += a.length;
   }
-
-  // Catalog and Pages will be patched at end
-  const catalogNum = objNum + 1;
-  const pagesNum   = objNum + 2;
-
-  // Reserve catalog
-  offsets.push(pdf.length);
-  pdf += `${++objNum} 0 obj\n<< /Type /Catalog /Pages ${pagesNum} 0 R >>\nendobj\n`;
-
-  // Reserve pages (placeholder, patch later)
-  const pagesObjStart = pdf.length;
-  offsets.push(pdf.length);
-  objNum++;
-  const pagesObjNum = objNum;
-  let pagesPlaceholder = `${pagesObjNum} 0 obj\n<<PAGES_PLACEHOLDER>>\nendobj\n`;
-  pdf += pagesPlaceholder;
-
-  const pageNums = [];
-
-  for (const pg of pages) {
-    const pdfW = Math.round(pg.pdfW);
-    const pdfH = Math.round(pg.pdfH);
-
-    // Decode base64 image bytes
-    const raw = atob(pg.b64);
-    const imgLen = raw.length;
-
-    // Image XObject
-    offsets.push(pdf.length);
-    objNum++;
-    const imgNum = objNum;
-    // We need binary content — build it with Uint8Array
-    const imgHeader = `${imgNum} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${pg.width} /Height ${pg.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${imgLen} >>\nstream\n`;
-    const imgFooter = `\nendstream\nendobj\n`;
-
-    // Store as parts
-    objs.push({ type: 'img', header: imgHeader, raw, footer: imgFooter, num: imgNum });
-
-    // Content stream: draw image filling the page
-    const cs = `q ${pdfW} 0 0 ${pdfH} 0 0 cm /Im${imgNum} Do Q`;
-    const csLen = cs.length;
-
-    offsets.push(0); // placeholder, fixed below
-    objNum++;
-    const csNum = objNum;
-    objs.push({ type: 'cs', content: `${csNum} 0 obj\n<< /Length ${csLen} >>\nstream\n${cs}\nendstream\nendobj\n`, num: csNum });
-
-    // Page object
-    offsets.push(0);
-    objNum++;
-    const pgNum = objNum;
-    objs.push({ type: 'page', content: `${pgNum} 0 obj\n<< /Type /Page /Parent ${pagesObjNum} 0 R /MediaBox [0 0 ${pdfW} ${pdfH}] /Contents ${csNum} 0 R /Resources << /XObject << /Im${imgNum} ${imgNum} 0 R >> >> >>\nendobj\n`, num: pgNum });
-    pageNums.push(pgNum);
+  function wBin(b64) {
+    const bin = atob(b64);
+    const a   = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i) & 0xFF;
+    parts.push(a); byteLen += a.length;
   }
+  function rec(n) { offsets[n] = byteLen; }
 
-  // Now assemble the real binary PDF
-  const parts = [];
-  const enc8 = str => {
-    const a = new Uint8Array(str.length);
-    for (let i = 0; i < str.length; i++) a[i] = str.charCodeAt(i) & 0xFF;
-    return a;
-  };
+  const n   = pages.length;
+  const iO  = i => 3 + i * 3;  // image obj number
+  const cO  = i => 4 + i * 3;  // content stream obj number
+  const pO  = i => 5 + i * 3;  // page obj number
+  const tot = 3 + n * 3;
 
-  const xrefOffsets = [];
-  let byteLen = 0;
-  const pushStr = s => { parts.push(enc8(s)); byteLen += s.length; };
-  const pushRaw = raw => {
-    const a = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) a[i] = raw.charCodeAt(i) & 0xFF;
-    parts.push(a); byteLen += raw.length;
-  };
-
-  // Header
-  pushStr('%PDF-1.4\n%\xFF\xFF\xFF\xFF\n');
+  wStr('%PDF-1.4\n%\xFF\xFF\xFF\xFF\n');
 
   // Catalog
-  xrefOffsets.push(byteLen);
-  pushStr(`1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n`);
+  rec(1); wStr('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
 
-  // Pages (placeholder, we'll know page refs)
-  const kidsStr = pageNums.map((n, i) => `${3 + i * 3} 0 R`).join(' ');
-  // Recompute page obj numbers: img=3, cs=4, page=5 for first; then 6,7,8 etc.
-  const realPageNums = [];
-  for (let i = 0; i < pages.length; i++) realPageNums.push(3 + i * 3 + 2);
-  const kidsStr2 = realPageNums.map(n => `${n} 0 R`).join(' ');
+  // Pages
+  const kids = pages.map((_, i) => `${pO(i)} 0 R`).join(' ');
+  rec(2); wStr(`2 0 obj\n<< /Type /Pages /Kids [${kids}] /Count ${n} >>\nendobj\n`);
 
-  xrefOffsets.push(byteLen);
-  pushStr(`2 0 obj\n<< /Type /Pages /Kids [${kidsStr2}] /Count ${pages.length} >>\nendobj\n`);
+  // One image + content stream + page object per page
+  for (let i = 0; i < n; i++) {
+    const pg = pages[i], imgN = iO(i), csN = cO(i), pgN = pO(i);
+    const imgLen = atob(pg.b64).length;
 
-  for (let i = 0; i < pages.length; i++) {
-    const pg = pages[i];
-    const pdfW = Math.round(pg.pdfW);
-    const pdfH = Math.round(pg.pdfH);
-    const imgObjN = 3 + i * 3;
-    const csObjN  = 4 + i * 3;
-    const pgObjN  = 5 + i * 3;
-    const raw = atob(pg.b64);
-    const imgLen = raw.length;
-
-    // Image XObject
-    xrefOffsets.push(byteLen);
-    pushStr(`${imgObjN} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${pg.width} /Height ${pg.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${imgLen} >>\nstream\n`);
-    pushRaw(raw);
-    pushStr(`\nendstream\nendobj\n`);
+    // Image XObject (JPEG)
+    rec(imgN);
+    wStr(`${imgN} 0 obj\n<< /Type /XObject /Subtype /Image`
+       + ` /Width ${pg.w} /Height ${pg.h}`
+       + ` /ColorSpace /DeviceRGB /BitsPerComponent 8`
+       + ` /Filter /DCTDecode /Length ${imgLen} >>\nstream\n`);
+    wBin(pg.b64);
+    wStr('\nendstream\nendobj\n');
 
     // Content stream
-    const cs = `q ${pdfW} 0 0 ${pdfH} 0 0 cm /Im${imgObjN} Do Q`;
-    xrefOffsets.push(byteLen);
-    pushStr(`${csObjN} 0 obj\n<< /Length ${cs.length} >>\nstream\n${cs}\nendstream\nendobj\n`);
+    const cs = `q ${pg.pdfW} 0 0 ${pg.pdfH} 0 0 cm /Im${imgN} Do Q`;
+    rec(csN);
+    wStr(`${csN} 0 obj\n<< /Length ${cs.length} >>\nstream\n${cs}\nendstream\nendobj\n`);
 
     // Page
-    xrefOffsets.push(byteLen);
-    pushStr(`${pgObjN} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pdfW} ${pdfH}] /Contents ${csObjN} 0 R /Resources << /XObject << /Im${imgObjN} ${imgObjN} 0 R >> >> >>\nendobj\n`);
+    rec(pgN);
+    wStr(`${pgN} 0 obj\n<< /Type /Page /Parent 2 0 R`
+       + ` /MediaBox [0 0 ${pg.pdfW} ${pg.pdfH}]`
+       + ` /Contents ${csN} 0 R`
+       + ` /Resources << /XObject << /Im${imgN} ${imgN} 0 R >> >>`
+       + ` >>\nendobj\n`);
   }
 
   // xref table
-  const xrefOffset = byteLen;
-  const totalObjs = 2 + pages.length * 3;
-  pushStr(`xref\n0 ${totalObjs + 1}\n`);
-  pushStr(`0000000000 65535 f \n`);
-  for (const off of xrefOffsets) {
-    pushStr(String(off).padStart(10, '0') + ' 00000 n \n');
+  const xrefPos = byteLen;
+  wStr(`xref\n0 ${tot}\n`);
+  wStr('0000000000 65535 f \n');
+  for (let i = 1; i < tot; i++) {
+    wStr((offsets[i] !== undefined ? String(offsets[i]) : '0').padStart(10, '0') + ' 00000 n \n');
   }
-  pushStr(`trailer\n<< /Size ${totalObjs + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+
+  // Trailer
+  wStr(`trailer\n<< /Size ${tot} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`);
 
   // Combine all parts
-  let totalLen = 0;
-  for (const p of parts) totalLen += p.length;
-  const out = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const p of parts) { out.set(p, offset); offset += p.length; }
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const out   = new Uint8Array(total);
+  let   pos   = 0;
+  for (const p of parts) { out.set(p, pos); pos += p.length; }
   return out.buffer;
 }
+
 
 // ── PRINT ──
 // Print disabled
